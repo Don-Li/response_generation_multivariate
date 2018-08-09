@@ -1,0 +1,797 @@
+---
+title: "On the Generation of Event Records"
+author: "Don Li"
+date: "25 June 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r libraries, message=FALSE}
+library( data.table )
+library( ggplot2 )
+# The CAB package is for the ks() function, which computes the Kolmogorov-Smirnov statistic.
+# R has a built-in function for the KS statistic, ks.test()
+library( CAB )
+library( grid )
+library( gridExtra )
+# Set up some parallel processing to make things go faster
+library( foreach ); library( doParallel )
+cluster_up = FALSE
+if ( !cluster_up ){
+    cl = makeCluster(5)
+    registerDoParallel(cl)
+    cluster_up = TRUE
+}
+```
+
+```{r helpers, echo = FALSE}
+ggplot_theme = theme(
+    panel.grid = element_blank(),
+    panel.background = element_rect( fill = NA, colour = "black" ),
+    axis.title.x = element_text( size = 7, colour = "black" ),
+    axis.title.y = element_text( size = 7, colour = "black" ),
+    axis.text.x = element_text( size = 7, colour = "black", margin = unit( rep(0,4),"cm" ) ),
+    axis.text.y = element_text( size = 7, colour = "black", margin = unit( rep(0,4),"cm" ) ),
+    plot.margin = margin( t = 0.1, r = 0.1, l = 0, b = 0.1, unit = "cm" )
+    )
+
+plot_save = function( plot, width, height ){
+    filename = paste0( substitute(plot), ".tiff" )
+    ggsave( filename, plot = plot, device = "tiff", width = width, height = height, units = "cm", dpi = 500, compression = "lzw" )
+}
+
+mean_irt_plot_limits = c(0,3)
+long_irt_shift_plot_limits = c(0,8)
+short_prob_plot_limits = c(0.5,1)
+mean_prp_plot_limits = c(2,8)
+```
+
+This document contains examples of doing parameter estimation for response generating models from multiple perspectives; Bayesian, Frequentist, and a non-statistical approach. We use a toy example that of a model that represents an organism that generates responses at a constant rate, but sometimes engages in some extraneous behaviours before returning to respond at a constant rate. The schedule is an FI schedule with a hold on the reinforcer delivery for inter-response times that are below some threshold.
+
+Note that the code for making the plots are not shown. To see this code, refer to the .rmd file that generated this document.
+
+The model is shown below:
+```{r model}
+double_exp_model = function( mean_irt, long_irt_shift, short_prob, mean_prp ){
+    
+    max_time = 10000
+    event_record = data.table( time = rep( NaN, 100000 ), event = rep( NaN, 100000 ) )
+    n_events = 1L; n_resps = 1L; n_rfts = 1L
+    
+    event_record_headers = c("time", "event")
+    
+    rft = FALSE; last_rft_time = 0
+    time_ = 0
+    
+    # Run the experiment
+    while ( time_ < max_time ){
+        if ( rft ){
+            resp_latency = rchisq( 1, mean_prp ) + 0.5
+            rft = FALSE
+        } else{
+            if ( runif(1) < short_prob ){
+                resp_latency = rexp( 1, 1/mean_irt ) + 0.1
+            } else{
+                resp_latency = rexp( 1, 1/mean_irt ) + 0.1 + long_irt_shift
+            }
+        }
+        time_ = time_ + resp_latency
+
+        # End if time elapsed
+        if ( time_ > max_time ) break
+
+        # Record response; code 1 for responses
+        set( event_record, i = n_events, j = event_record_headers, value = list( time_, 1 ) )
+        n_events = n_events + 1L
+
+        # Deliver reinforcer and arrange the next one
+        if ( resp_latency > 4.5 & time_ - last_rft_time > 15 ){
+            # Record reinforcer; code 10 for responses
+            set( event_record, i = n_events, j = event_record_headers, value = list( time_, 10 ) )
+            n_events = n_events + 1L
+            rft = TRUE
+            last_rft_time = time_
+        }
+    }
+    # Return the event record
+    event_record[ !is.na(time) ]
+}
+
+```
+We note that the arranged inter-reinforcer interval (IRI) for the FI schedule is 15s, reinforcers are not delivered for repsonses with an inter-response time (IRT) of less than 4.5s, and the minimum IRT is 0.1s. The experiment terminates after 10000s.
+
+The true parameters are shown in the chunk below:
+```{r True parameters}
+true_parameters = c( mean_irt = 1.5, long_irt_shift = 4, short_prob = 0.7, mean_prp = 5 )
+```
+Thus, IRTs are emitted at an average of $\lambda_{irt}=$ `r true_parameters["mean_irt"]`, and on $p_{short}=$ `r true_parameters["short_prob"]`, the organism does $c_{extraneous}=$ `r true_parameters["long_irt_shift"]` seconds of extraneous behaviour. After a reinforcer, the next response is emitted from a Chi-square distribution with the mean $mean_prp=$ `r true_parameters["mean_prp"]`.
+
+Because the model generates an event record and because event records are complex, we are motivated to summarise the event records with a set of summary. Here, we are going to use the IRT distribution, the IRI distribution, and the PRP distribution. In our examples, we will use the IRTs and PRPs as dependent variables for fitting the model. The IRI distribution will be used as a post-fit variable, mostly as a sanity check. We will also trim top 1% of the the IRT/PRP/IRI distributions to make life easier.
+```{r Summary statistics}
+# Function to extract the dependent variables of interest
+summary_statistics = function( event_record, iri = FALSE ){
+    event_record[ , {
+        temp_time = time
+        rfts = which( event == 10 )
+        prp_resp = rfts + 1
+        
+        # Skip responses separated by reinforcers
+        temp_time[ rfts ] = NaN
+        temp_time[ prp_resp ] = NaN
+        irts = diff( temp_time )
+        irts = irts[ !is.na(irts) ]
+        irts = irts[ irts < quantile(irts, 0.99) ]
+        
+        prps = time[ prp_resp ] - time[ rfts ]
+        prps = prps[ !is.na(prps) ]
+        prps = prps[ prps < quantile(prps, 0.99) ]
+        
+        if ( iri ){
+            iris = diff( time[ event == 10 ] )
+            iris = iris[ iris < quantile(iris, 0.99) ]
+            return( list( irts = list(irts), iris = list(iris), prps = list(prps) ) )
+        } else{
+            return( list( irts = list(irts), prps = list(prps) ) )
+        }
+    } ]
+}
+```
+
+Now, we simulate some data from the model. These will be our "observed" data.
+```{r Observed data}
+set.seed(1)
+observed_event_record = do.call( double_exp_model, as.list(true_parameters) )
+```
+
+Let's do some exploratory analysis of the data. First, we will look at a cumulative record to see if things make sense (Figure 1). As we can see, reinforcers were never delivered in the steepest parts of the cumulative record (i.e., when the model was emitting fast IRTs).
+```{r exploratory analysis, fig.cap = "Figure 1. Cumulative record for first 200s of observed data", echo = FALSE, fig.width = 3, fig.height = 3}
+temp_observed_event_record = copy( observed_event_record )
+temp_observed_event_record = temp_observed_event_record[ time < 1000]
+temp_observed_event_record = temp_observed_event_record[, cumulative_responses := {
+    cumulative_responses = event
+    cumulative_responses[ cumulative_responses == 10 ] = 0
+    cumulative_responses = cumsum( cumulative_responses )
+} ]
+cumulative_record = ggplot( temp_observed_event_record ) +
+    geom_line( aes( x = time, y = cumulative_responses ) ) +
+    geom_point( aes( x = time, y = cumulative_responses ), data = temp_observed_event_record[event==10], colour = "red" ) +
+    scale_y_continuous( name = "Cumulative Responses" ) +
+    scale_x_continuous( name = "Time" ) +
+    ggplot_theme
+cumulative_record
+```
+
+Table 1 summarises the frequencies in the event record.
+```{r summary table, fig.cap = "Table 1. Frequencies in the event record", echo = FALSE}
+event_table = observed_event_record[ , table( event ) ]
+names(event_table) = c("Responses", "Reinforcers")
+event_table
+```
+
+The following figures show the observed IRT, PRP, and IRI distributions.  
+```{r latency distribution plots, fig.height=3, fig.width=3, echo = FALSE, fig.cap = "Figure 2. Observed IRT and IRI distributions."}
+# Extract IRT and IRI distributions
+observed_data = summary_statistics( observed_event_record, iri = TRUE )
+# Plot IRT and IRI distributions
+# Use a kernel density estimator to smooth things out
+irt_data = as.data.table( observed_data[ , irts ] )
+prp_data = as.data.table( observed_data[ , prps ] )
+iri_data = as.data.table( observed_data[ , iris ] )
+
+irt_plot = ggplot( irt_data ) +
+    geom_density( aes( x = V1 ) ) +
+    geom_histogram( aes( x = V1, y = ..density.. ), bins = 100, alpha = 0.5 ) +
+    scale_x_continuous( name = "Inter-response time (s)" ) +
+    scale_y_continuous( name = "Density" ) +
+    ggplot_theme
+
+prp_plot = ggplot( prp_data ) +
+    geom_density( aes( x = V1 ) ) +
+    geom_histogram( aes( x = V1, y = ..density.. ), bins = 50, alpha = 0.5 ) +
+    scale_x_continuous( name = "Post-reinforcer pause (s)" ) +
+    scale_y_continuous( name = "Density" ) +
+    ggplot_theme
+
+iri_plot = ggplot( iri_data ) +
+    geom_density( aes( x = V1 ) ) +
+    geom_histogram( aes( x = V1, y = ..density.. ), bins = 100, alpha = 0.5 ) +
+    scale_x_continuous( name = "Inter-reinforcer interval (s)" ) +
+    scale_y_continuous( name = "Density (x10)", labels = function(x) x*10 ) +
+    ggplot_theme
+
+
+latency_plots = cowplot::align_plots( irt_plot, prp_plot, iri_plot, align = "hv" )
+latency_plots = grid.arrange( grobs = latency_plots, ncol = 1 )
+plot_save( latency_plots, width = 7, height = 9 )
+```
+
+# Non-Statistical
+We fit our toy example to the IRT and IRI distributions by minimising the two-sample Kolmogorov-Smirnov statistic for both variables. The two-sample KS statistic is a measure of poorness of fit for two distributions. When $KS=1$, there is no overlap between the distributions. When $KS=0$, there is complete overlap between the distributions everywhere.
+
+The optimisation algorithm that we use essentially resamples preivously tried parameters and adds a bit of noise (determined by the bandwidth) to search around a bit. We combine all of the proposed solutions and then we take the best 1% for the IRT and IRIs. For real applications, it is best not to use this algorithm. Better to use something that has been well-validated, such as evolutionary algorithms, differential evolution, and the like.
+
+This example takes about 3-4 minutes on my home computer.
+```{r non_statistical fitting, results = FALSE}
+knitr::opts_chunk$set(cache = TRUE )
+
+get_cost = function( parameters ){
+    # If the parameters are out of bounds, set cost function to infinity.
+    if ( any( parameters < 0 ) | parameters["short_prob"] > 1 ){
+        return( c(parameters,Inf, Inf) )
+    }
+    
+    # Run the model
+    predicted_event_record = do.call( double_exp_model, as.list(parameters) )
+
+    # Extract the IRT and IRI distributions
+    predicted_variables = summary_statistics( predicted_event_record )
+    # Calculate the KS for the IRTs and IRIs
+    irt_ks = ks( predicted_variables$irts[[1]], observed_data$irts[[1]] )
+    prp_ks = ks( predicted_variables$prps[[1]], observed_data$prps[[1]] )
+    
+    return_vector = c( parameters, irt_ks, prp_ks )
+    print( return_vector )
+    return_vector
+}
+
+if ( !"non_statistical.RData" %in% list.files("D:/Dropbox/Dropbox/Don/statistics_paper/statistics_notebook/") ){
+    set.seed(4)
+    # Run for 5000 iterations
+    n_proposals = 5000
+    
+    # Set bandwidth for search
+    bw = c( 1, 1.5, 0.2, 2 ); min_bw = bw*(0.99^200)
+    
+    storage = data.table( "mean_irt" = rep( NaN, n_proposals ) )
+    
+    for ( proposal in 1:n_proposals ){
+        print( paste0( "Iteration ", proposal ) )
+        if ( proposal == 1 ){
+            new_proposal = true_parameters
+            # I chose some random numbers for seeding
+            new_proposal[] = c(2.5, 3, 0.5, 4 )
+        } else if ( proposal < 1000 ){
+            # Sample one of the previously tried parameters
+                new_proposal = storage[ is.finite(irt_ks+prp_ks) ][ sample.int(.N,1), names(true_parameters), with = FALSE ]
+                new_proposal = unlist( new_proposal )
+        } else{
+            # Sample one of the parameters that in the best 100 for the IRTs and the IRIs
+            new_proposal = storage[ is.finite(irt_ks+prp_ks),{
+                ranks = rank(irt_ks) + rank( prp_ks )
+                .SD[ sample.int( .N, 1, prob = 1/ranks ), names( true_parameters ), with = F  ]
+            } ]
+            new_proposal = unlist( new_proposal )
+        }
+        # Add some noise to the parameters
+        if ( proposal >= 1000 ){
+            bw = bw*0.99
+            bw = pmax( bw, min_bw )
+        }
+        new_proposal = runif( length(new_proposal), new_proposal-bw, new_proposal+bw  )
+        names(new_proposal) = names( true_parameters )
+    
+        proposed_cost = get_cost( new_proposal )
+        set( storage, i = proposal, j = c(names(true_parameters), "irt_ks", "prp_ks" ), value = as.list(proposed_cost) )
+    }
+    
+    save( storage, file = "non_statistical.RData" )
+} else{
+    load( "non_statistical.RData" )
+}
+```
+
+Because we are fitting to two variables, we are required to consider the relative value of each variable when defining the "best" solution. Here, we will define the "best" solutions as those that provide the best fit (lowest 20% of KS values) for the IRT distribution AND the IRI distribution. The geometry of this is shown below in Figure 3. The vertical line demarcates the best 20% of IRT KS values, while the horizontal line demarcates the best 20% of IRI KS values. The black points are those that are in the best 20% for either variable.
+```{r get plausible distribution, fig.cap = "Figure 3. Geometry of the best solution.", fig.width = 3, fig.height = 3, echo = FALSE}
+plausible_distribution = storage[ irt_ks <= quantile( irt_ks, 0.2) & prp_ks <= quantile( prp_ks, 0.2 ) ]
+
+temp_storage = copy( storage )
+temp_storage[ , best_irt := ( irt_ks < quantile( irt_ks, 0.2 ) ) ]
+temp_storage[ , best_prp := ( prp_ks < quantile( prp_ks, 0.2 ) ) ]
+temp_storage[ , pt_fill := as.character( ( ( best_irt + best_prp ) >= 2 ) * 1.0 ) ]
+pareto_plot = ggplot( temp_storage[ is.finite( irt_ks +prp_ks ) ] ) +
+    geom_point( aes( x = irt_ks, y = prp_ks, fill = pt_fill ), shape = 21, show.legend = F, alpha = 0.5 ) +
+    geom_hline( yintercept = quantile( storage$prp, 0.2 ) ) +
+    geom_vline( xintercept = quantile( storage$irt, 0.2 ) ) +
+    scale_fill_manual( values = c( "0" = "white", "1" = "black" ) ) +
+    scale_y_continuous( name = "PRP KS", breaks = c(0,0.5,1) ) +
+    scale_x_continuous( name = "IRT KS", breaks = c(0,0.5,1) ) +
+    ggplot_theme
+
+plot_save( pareto_plot, width = 7, height = 7 )
+print( pareto_plot )
+```
+
+```{r non_statistical results processing, echo = FALSE, fig.cap = "Figure 4. Plausible distributions", fight.height = 3, fig.width = 3 }
+mean_irt_plausible_plot = ggplot( plausible_distribution ) +
+    geom_density( aes( x = mean_irt ) ) +
+    geom_histogram( aes( x = mean_irt, y = ..density.. ), alpha = 0.5, bins = 75 ) +
+    geom_vline( xintercept = true_parameters["mean_irt"] ) +
+    scale_y_continuous( name = "Density" ) +
+    scale_x_continuous( name = "mean IRT parameter", limits = mean_irt_plot_limits ) +
+    ggplot_theme
+
+long_irt_shift_plausible_plot = ggplot( plausible_distribution ) +
+    geom_density( aes( x = long_irt_shift ) ) +
+    geom_histogram( aes( x = long_irt_shift, y = ..density.. ), alpha = 0.5, bins = 100 ) +
+    geom_vline( xintercept = true_parameters["long_irt_shift"] ) +
+    scale_y_continuous( name = "Density" ) +
+    scale_x_continuous( name = "long IRT shift parameter", limits = long_irt_shift_plot_limits ) +
+    ggplot_theme
+
+short_prob_shift_plausible_plot = ggplot( plausible_distribution ) +
+    geom_density( aes( x = short_prob ) ) +
+    geom_histogram( aes( x = short_prob, y = ..density.. ), alpha = 0.5, bins = 100 ) +
+    geom_vline( xintercept = true_parameters["short_prob"] ) +
+    scale_y_continuous( name = "Density" ) +
+    scale_x_continuous( name = "short prob parameter", limits = short_prob_plot_limits ) +
+    ggplot_theme
+
+mean_prp_plausible_plot = ggplot( plausible_distribution ) +
+    geom_density( aes( x = mean_prp ) ) +
+    geom_histogram( aes( x = mean_prp, y = ..density.. ), alpha = 0.5, bins = 100 ) +
+    geom_vline( xintercept = true_parameters["mean_prp"] ) +
+    scale_y_continuous( name = "Density" ) +
+    scale_x_continuous( name = "mean PRP parameter", limits = mean_prp_plot_limits ) +
+    ggplot_theme
+
+plausible_plots = cowplot::align_plots( mean_irt_plausible_plot, long_irt_shift_plausible_plot, short_prob_shift_plausible_plot, mean_prp_plausible_plot, align = "hv" )
+plausible_plots = grid.arrange( grobs = plausible_plots, nrow = 2 )
+plot_save( plausible_plots, width = 7, height = 7.5 )
+```
+
+Now that we have fit the model and obtained our plausible distributions, we want to simulate data from the plausible distribution to see the predicted data.
+
+```{r non_statistical predictions}
+if( !"predicted_plausible.RData" %in% list.files() ){
+    # Simulate 2000 event records for our predictions
+    set.seed(1)
+    simulate_parameters = plausible_distribution[ sample( 1:.N, 1000, replace = T ), names(true_parameters), with = F ]
+    #Remember to change the .packages() if you are not using CAB2
+    predicted_event_records = foreach( x = 1:1000, .packages = c("data.table", "CAB2")) %dopar% {
+        parameters = simulate_parameters[x]
+        predicted_event_record = do.call( double_exp_model, parameters )
+        predicted_distributions = summary_statistics( predicted_event_record, iri = TRUE )
+        # Precompute the density for the IRT and IRI distributions
+        irt_density = density( predicted_distributions$irts[[1]], from = 0, n = 100 )
+        prp_density = density( predicted_distributions$prps[[1]], from = 0, to = 25, n = 100 )
+        iri_density = density( predicted_distributions$iris[[1]], from = 0, to = 75, n = 100 )
+        list( id = x, 
+            irts_x = irt_density$x, irts_y = irt_density$y, 
+            iris_x = iri_density$x, iris_y = iri_density$y,
+            prps_x = prp_density$x, prps_y = prp_density$y)
+    }
+    predicted_irts = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","irts_x","irts_y")]) ) )
+    predicted_iris = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","iris_x","iris_y")]) ) )
+    predicted_prps = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","prps_x","prps_y")]) ) )
+    save( predicted_irts, predicted_iris, predicted_prps, file = "predicted_plausible.RData" )
+} else{
+    load( "predicted_plausible.RData" )
+}
+```
+
+```{r plot non statistical predictions, fig.height = 3, fig.width = 3, echo = FALSE, fig.cap = "Figure 5. Non-Statistical Predictions"}
+text_frame = data.table( x = Inf, y = c(Inf,-Inf), labels = c("Observed", "Predicted"), vjust = c(1,-0.1), hjust = c(1,1) )
+
+non_statistical_predicted_irts = ggplot() +
+    geom_line( aes( x = irts_x, y = -irts_y, group = id ), data = predicted_irts, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = irt_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "IRT (s)" ) +
+    scale_y_continuous( name = "Absolute Density", labels = abs, limits = 0.4*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+non_statistical_predicted_prps = ggplot() +
+    geom_line( aes( x = prps_x, y = -prps_y, group = id ), data = predicted_prps, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = prp_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "PRP (s)", limits = c(0,25) ) +
+    scale_y_continuous( name = "Absolute Density", labels = abs, limits = 0.2*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+non_statistical_predicted_iris = ggplot() +
+    geom_line( aes( x = iris_x, y = -iris_y, group = id ), data = predicted_iris, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = iri_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "IRI (s)", breaks = c(0,25,50,75) ) +
+    scale_y_continuous( name = "Absolute Density (x100)", labels = function(x) abs(x)*100, limits = 0.15*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+
+non_statistical_predictions = cowplot::align_plots( non_statistical_predicted_irts, non_statistical_predicted_prps, non_statistical_predicted_iris, align = "hv" )
+non_statistical_prediction_plots = grid.arrange( grobs = non_statistical_predictions, ncol = 1 )
+
+plot_save( non_statistical_prediction_plots, width = 7, height = 9 )
+# Remove objects to save memory if needed
+rm( non_statistical_predicted_iris, non_statistical_predicted_irts, non_statistical_predictions, non_statistical_prediction_plots, predicted_iris, predicted_irts, predicted_prps )
+```
+
+# Approximate likelihood inference
+In this example, we fit our toy example to the data using an approximate likelihood technique, where we simulate the model to construct empirical likelihoods. Recall that the likelihood is the distribution of the data given the parameters. If we have the model, then we can simulate the likelihood by choosing a parameter value, repeatedly simulating the model, and then extracting the distribution of the variables of interest. The simulation of the likelihoods is done in the `simulate_likelihoods()` function.
+
+Due to the error associated with simulating the likelihood, we have simulated the likelihood on a grid of parameters instead of using an optimisation algorithm. We then used a `loess()` to estimate the minimum.
+
+We added the following constraints:
+* If any of the parameters were ouf of their defined boundaries, the likelihood was `Inf`.
+* If there was only one PRP, the likelihood was set to `Inf`.
+* If there was an `NA` in the approximate log likelihood, it was set to `Inf`.
+To simulate the likelihood, we simulated the model at the given parameters for 100 sessions. We then combined the IRT and IRIs across all of those sessions. Using the combined IRT and IRI distributions, we approximated the distribution with `density()` and then created a function using `approxfun()`. Following the Turner and Sederberg (2014) paper, we used the Epanechnikov kernel. Further, because of the error associated with the kernel density estimatior, we subtract the known minimiums from each of the latencies.
+
+```{r empirical_likelihood}
+simulate_likelihoods = function( parameters, double_exp_model, summary_statistics ){
+    # Parameter constraits
+    if ( any( parameters < 0 ) | parameters["short_prob"] > 1 ){
+        return( c(parameters,Inf,Inf,Inf ) )
+    }
+    
+    # Simulate 100 sessions
+    # Remember to change the packages here if you are not using CAB2
+    results = foreach( i = 1:5, .packages = c("data.table", "CAB2") ) %dopar%{
+        results2 = lapply( 1:20, function(x){
+            predicted_event_record = do.call( double_exp_model, as.list( parameters ) )
+            predicted_variables = summary_statistics( predicted_event_record )
+        } )
+        rbindlist( results2[1] )
+    }
+    results = rbindlist( results )
+    if ( length( results$prps[[1]] ) < 2 ){
+        return( c(parameters,Inf,Inf,Inf) )
+    }
+    
+    # Compute approximate likelihoods
+    irt_density = density( ( unlist(results$irts)-0.1 ), kernel = "epanechnikov", from = 0 )
+    irt_likelihood = approxfun( irt_density )
+    prp_density = density( ( unlist(results$prps)-0.5 ), kernel = "epanechnikov", from = 0 )
+    prp_likelihood = approxfun( prp_density )
+    # # Use negative log likelihood
+    irt_log_likelihood = sum( log( irt_likelihood( ( observed_data$irts[[1]]-0.1 ) ) ) )
+    prp_log_likelihood = sum( log( prp_likelihood( ( observed_data$prps[[1]]-0.5 ) ) ) )
+
+    # Return the joint likelihood
+    sum_neg_log_likelihood = - (irt_log_likelihood + prp_log_likelihood)
+
+    if ( is.na(sum_neg_log_likelihood) ) return( c(parameters,Inf, Inf, Inf ) )
+    c( parameters, sum_neg_log_likelihood, irt_log_likelihood, prp_log_likelihood )
+}
+```
+
+To fit our model using the approximate likelihood technique, we defined an optimisaiton algorithm that searches the parameter space using Uniform distributions that gradually shrink as the model fitting process progresses. New parameters are proposed by taking up to the best 10 parameter configurations previously observed and then perturbing them by a small amount.  
+
+```{r approx_likelihood_fit, results = "hide"}
+if ( ! "likelihood_results.RData" %in% list.files() ){
+    set.seed(2)
+    
+    param_matrix = data.table( expand.grid(
+        mean_irt = seq( 0.5, 2.5, length.out = 10 ),
+        long_irt_shift = seq( 2.5, 5.5, length.out = 10 ),
+        short_prob = seq( 0.5, 0.9, length.out = 10 ),
+        mean_prp = seq( 3.5, 6.5, length.out = 10 )
+    ) )
+    n_iterations = nrow( param_matrix )
+    storage_likelihood = data.table( "mean_irt" = rep(NaN, n_iterations) )
+
+
+    # Fit the model; this takes quite a long time.
+    for ( i in 1:n_iterations ){
+        print( paste0( "Iteration ", i ) )
+        new_proposal = unlist(param_matrix[i])
+    
+        # Simulate likelihood
+        new_likelihood = simulate_likelihoods( new_proposal, double_exp_model, summary_statistics )
+        # Decrease bandwidth
+        set( storage_likelihood, i = i, j = c(names(true_parameters), "likelihood", "irt", "prp" ), value = as.list(new_likelihood) )
+    }
+    save( storage_likelihood, file = "likelihood_results.RData" )
+} else{
+    load( "likelihood_results.RData" )
+}
+
+# Remove infinite values
+storage_likelihood = storage_likelihood[ is.finite( likelihood ) ]
+```
+
+```{r approx_likelihood_processing}
+smoothed_likelihood = loess( likelihood ~ mean_irt + long_irt_shift + short_prob, data = storage_likelihood )
+storage_likelihood[ , predicted_likelihood := predict( smoothed_likelihood, storage_likelihood ) ]
+
+predicted_mle = optim( true_parameters, function(x){
+    d = as.data.table( as.list( x ) )
+    predict( smoothed_likelihood, d )
+} )
+predicted_mle = data.table( V1 = predicted_mle$par, name = names(true_parameters), val = "Est" )
+true_ = data.table( V1 = true_parameters, name = names( true_parameters ), val = "True" )
+vline_dt = rbindlist( list(true_, predicted_mle) )
+```
+
+```{r approx_likelihood_results, echo = FALSE, fig.height=3, fig.width=3, fig.cap = "Figure 6. Approximate likelihood results"}
+y_lab = "Neg log likelihood (x1000)"
+gradient_mean_irt = ggplot( storage_likelihood ) +
+    geom_point( aes( x = mean_irt, y = likelihood ), size = 0.5 ) +
+    ggplot_theme +
+    scale_y_continuous( name = y_lab, labels = function(x)x/1000 ) +
+    scale_x_continuous( name = "mean IRT parameter", limits = mean_irt_plot_limits ) +
+    geom_vline( aes( xintercept = V1, linetype = val ), data = vline_dt[name == "mean_irt"], show.legend = F) +
+    scale_linetype_manual( values = c("dotted", "solid") ) 
+
+gradient_long_irt_shift = ggplot( storage_likelihood ) +
+    geom_point( aes( x = long_irt_shift, y = likelihood ), size = 0.5 ) +
+    ggplot_theme +
+    scale_y_continuous( name = y_lab, labels = function(x)x/1000 ) +
+    scale_x_continuous( name = "long IRT shift parameter", limits = long_irt_shift_plot_limits ) +
+    geom_vline( aes( xintercept = V1, linetype = val ), vline_dt[name == "long_irt_shift"] ) +
+    scale_linetype_manual( values = c("dotted", "solid") ) +
+    theme( legend.position = c(0.25,0.85), legend.title = element_blank(), legend.text = element_text(size = 7),
+        legend.key.height = unit(0.4,"cm"), legend.background = element_blank(), legend.key.width = unit(0.4,"cm") )
+
+gradient_p_short = ggplot( storage_likelihood ) +
+    geom_point( aes( x = short_prob, y = likelihood ), size = 0.5 ) +
+    ggplot_theme +
+    scale_y_continuous( name = y_lab, labels = function(x)x/1000 ) +
+    scale_x_continuous( name = "short prob parameter", limits = short_prob_plot_limits ) +
+    geom_vline( aes( xintercept = V1, linetype = val ), vline_dt[name == "short_prob"], show.legend = F ) +
+    scale_linetype_manual( values = c("dotted", "solid") )
+
+gradient_mean_prp = ggplot( storage_likelihood ) +
+    geom_point( aes( x = mean_prp, y = likelihood ), size = 0.5 ) +
+    ggplot_theme +
+    scale_y_continuous( name = y_lab, labels = function(x)x/1000 ) +
+    scale_x_continuous( name = "mean PRP parameter", limits = mean_prp_plot_limits ) +
+    geom_vline( aes( xintercept = V1, linetype = val ), vline_dt[name == "mean_prp"], show.legend = F ) +
+    scale_linetype_manual( values = c("dotted", "solid") )
+
+approx_likelihood_plots = grid.arrange( gradient_mean_irt, gradient_long_irt_shift, gradient_p_short, gradient_mean_prp, nrow = 2 )
+plot_save( approx_likelihood_plots, width = 7, height = 7.5 )
+```
+
+To generate predictions, we simulate the model 1000 times at our approximate maximum likelihood estimates. The predictions are shown in Figure 7.
+
+```{r make appox_likelihood predictions}
+if( !"predicted_approx_likelihood.RData" %in% list.files() ){
+    # Simulate 1000 event records for our predictions
+    set.seed(1)
+    simulate_parameters = transpose( predicted_mle[ , list(V1) ] ); names(simulate_parameters) = names(true_parameters)
+    simulate_parameters = simulate_parameters[ rep( 1, 1000 ) ]
+    #Remember to change the .packages() if you are not using CAB2
+    predicted_event_records = foreach( x = 1:1000, .packages = c("data.table", "CAB2")) %dopar% {
+        parameters = simulate_parameters[x]
+        predicted_event_record = do.call( double_exp_model, parameters )
+        predicted_distributions = summary_statistics( predicted_event_record, iri = TRUE )
+        # Precompute the density for the IRT and IRI distributions
+        irt_density = density( predicted_distributions$irts[[1]], from = 0, n = 100 )
+        prp_density = density( predicted_distributions$prps[[1]], from = 0, to = 25, n = 100 )
+        iri_density = density( predicted_distributions$iris[[1]], from = 0, to = 75, n = 100 )
+        list( id = x, 
+            irts_x = irt_density$x, irts_y = irt_density$y, 
+            iris_x = iri_density$x, iris_y = iri_density$y,
+            prps_x = prp_density$x, prps_y = prp_density$y)
+    }
+    predicted_irts = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","irts_x","irts_y")]) ) )
+    predicted_iris = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","iris_x","iris_y")]) ) )
+    predicted_prps = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","prps_x","prps_y")]) ) )
+    save( predicted_irts, predicted_iris, predicted_prps, file = "predicted_approx_likelihood.RData" )
+} else{
+    load( "predicted_approx_likelihood.RData" )
+}
+```
+
+```{r appox_likelihood predictions, fig.height = 3, fig.width = 3, echo = FALSE, fig.cap = "Figure 7. Approximate likelihood predictions"}
+text_frame = data.table( x = Inf, y = c(Inf,-Inf), labels = c("Observed", "Predicted"), vjust = c(1,-0.1), hjust = c(1,1) )
+
+like_predicted_irts = ggplot() +
+    geom_line( aes( x = irts_x, y = -irts_y, group = id ), data = predicted_irts, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = irt_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "IRT (s)" ) +
+    scale_y_continuous( name = "Absolute Density", labels = abs, limits = 0.4*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+like_predicted_prps = ggplot() +
+    geom_line( aes( x = prps_x, y = -prps_y, group = id ), data = predicted_prps, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = prp_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "PRP (s)", limits = c(0,25) ) +
+    scale_y_continuous( name = "Absolute Density", labels = abs, limits = 0.2*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+like_predicted_iris = ggplot() +
+    geom_line( aes( x = iris_x, y = -iris_y, group = id ), data = predicted_iris, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = iri_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "IRI (s)", breaks = c(0,25,50,75) ) +
+    scale_y_continuous( name = "Absolute Density (x100)", labels = function(x) abs(x)*100, limits = 0.15*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+
+like_statistical_predictions = cowplot::align_plots( like_predicted_irts, like_predicted_prps, like_predicted_iris, align = "hv" )
+like_prediction_plots = grid.arrange( grobs = like_statistical_predictions, ncol = 1 )
+
+plot_save( like_prediction_plots, width = 7, height = 9 )
+
+rm( predicted_irts, predicted_prps, predicted_iris, predicted_event_records )
+```
+# Approximate Bayesian Computation
+The following figure illustrates the relationships between the distribution of the data and the prior. Recall that the posterior is the probability of the parameters (from the prior) given the data (from the data). For continuous data, we use a threshold so that all of the data within the threshold is "close enough" to the observed data. The parameter values that fall within the tolerance region form the approximate posterior.  
+
+```{r ABC_illustration, echo = FALSE}
+set.seed(1)
+abc_illustration = data.table( prior = abs( rnorm( 10000, 5, 5 ) ) )
+abc_illustration[ , data := rgamma( 10000, 3, 1/prior ) ] 
+# Data is 20
+abc_data = 40
+abc_threshold = 5
+posterior_frame = abc_illustration[ abs( abc_data - data ) <= abc_threshold ] 
+
+text_frame = data.table( name = c("Prior", "Data", "Posterior", "Data and parameter"), x = Inf, y = Inf, vjust = 1, hjust = 1 )
+text_frame2 = data.table( name = "Observed data", x = 0, y = Inf, vjust = 1, hjust = 0.5 )
+text_frame3 = data.table( name = "Tolerance", x = abc_data , y = 1, vjust = 1, hjust = 0.5 )
+arrow_frame = data.table( x = abc_data + abc_threshold * c(-1,1), y = 1.5 )
+
+prior_and_data = ggplot( abc_illustration ) +
+    geom_point( aes( x = data, y = prior ), shape = "." ) +
+    ggplot_theme +
+    theme( axis.text.x = element_blank(), axis.text.y = element_blank() ) +
+    scale_x_continuous( name = "Data" ) + scale_y_continuous( name = "Parameter" ) +
+    geom_vline( xintercept = abc_data, linetype = "dashed" ) + 
+    geom_text( aes( x = x, y = y, label = name, vjust = vjust, hjust = hjust, size = size ), text_frame3, size = 3 ) +
+    geom_vline( xintercept = abc_data + abc_threshold * c(-1,1) ) +
+    geom_path( aes( x = x, y = y ), arrow_frame, arrow = arrow( type = "open", ends = "both", length = unit(0.15,"cm") ) ) +
+    geom_text( aes( x = x, y = y, label = name, vjust = vjust, hjust = hjust, size = size ), text_frame[name == "Data and parameter"], size = 3 )
+
+posterior_plot = ggplot( posterior_frame ) +
+    geom_density( aes( x = prior ) ) +
+    ggplot_theme  +
+    theme( axis.text.x = element_blank(), axis.text.y = element_blank() ) +
+    geom_text( aes( x = x, y = y, label = name, vjust = vjust, hjust = hjust, size = size ), text_frame[name == "Posterior"], size = 3 ) +
+    scale_x_continuous( name = "Parameter" ) + scale_y_continuous( name = "Density" )
+
+abc_illustration_ = cowplot::align_plots( prior_and_data, posterior_plot, align = "hv" )
+abc_illustration_ = grid.arrange( grobs = abc_illustration_, ncol = 1 )
+plot_save( abc_illustration_, width = 7, height = 7 )
+```
+
+Here, we use a simple ABC-rejection algorithm. We need to:  
+
+* Define our priors (`sample_prior()`)
+* Define the goodness of fit statistics for the IRT and IRI distributions (two-sample Kolmogorov-Smirnov statistic)
+* Define thresholds for the IRT and IRI KS statistics. We used 0.06 because this seemed like a good compromise between the number of simulations we would have to do and the number of samples in our approximate posterior.
+
+```{r ABC, results = FALSE}
+rprior = function(n_samples){
+    matrix( c(
+        mean_irt = runif(n_samples, 0.5, 2.5 ),
+        long_irt_shift = runif( n_samples,2,6 ),
+        short_prob = runif( n_samples, 0.5, 0.9 ),
+        mean_prp = runif( n_samples, 3, 7 )
+    ), ncol = 4 )
+}
+
+threshold_irt = threshold_prp = 0.06
+n_samples = 50000
+sample_headers = c( names(true_parameters), "irt_ks", "prp_ks" )
+n_parallel = 5
+set.seed(3)
+joint_samples = data.table( rprior(n_samples) )
+names(joint_samples) = names(true_parameters) 
+joint_samples[ , cluster := rep(1:n_parallel, each = n_samples/n_parallel ) ]
+
+if ( ! "ABC_results.RData" %in% list.files() ){
+    all_samples = foreach( i = 1:n_parallel, .packages = c("data.table","CAB2") ) %dopar% {
+        set.seed(i)
+        joint_samples2 = joint_samples[ cluster == i ] 
+        for ( samples in 1:nrow(joint_samples2) ){
+            proposed_prior = joint_samples2[ samples, names(true_parameters), with = F ]
+            predicted_event_record = do.call( double_exp_model, as.list(proposed_prior) )
+            predicted_variables = summary_statistics( predicted_event_record )
+            
+            irt_ks = ks( predicted_variables$irts[[1]], observed_data$irts[[1]] )
+            prp_ks = ks( predicted_variables$prps[[1]], observed_data$prps[[1]] )
+            sample_entry = as.list( c( proposed_prior, irt_ks, prp_ks ) )
+            
+            set( joint_samples2, i = samples, j = sample_headers, value = sample_entry )
+        }
+        joint_samples2
+    }
+    
+    all_samples = rbindlist( all_samples )
+    
+    save( all_samples, file = "ABC_results.RData" )
+} else{
+    load( "ABC_results.RData" )
+}
+posterior_samples = all_samples[ irt_ks < threshold_irt & prp_ks < threshold_prp ]
+```
+
+The following figures show the approximate posteriors obtained from the ABC-rejection algorithm.  
+```{r abc_plots, fig.height=3, fig.width=3, echo = FALSE, fig.cap = "Figure 7. ABC posterior"}
+mean_irt_posterior = ggplot( posterior_samples ) +
+    geom_density( aes( x = mean_irt ) ) +
+    geom_histogram( aes( x = mean_irt, y = ..density.. ), alpha = 0.5, bins = 70 ) +
+    ggplot_theme +
+    scale_y_continuous( name = "Density" ) + scale_x_continuous( name = "mean IRT parameter", limits = mean_irt_plot_limits ) +
+    geom_vline( xintercept = true_parameters["mean_irt"] )
+
+long_irt_shift_posterior = ggplot( posterior_samples ) +
+    geom_density( aes( x = long_irt_shift ) ) +
+    geom_histogram( aes( x = long_irt_shift, y = ..density.. ), alpha = 0.5, bins = 70 ) +
+    ggplot_theme +
+    scale_y_continuous( name = "Density" ) + scale_x_continuous( name = "long IRT shift parameter", limits = long_irt_shift_plot_limits ) +
+    geom_vline( xintercept = true_parameters["long_irt_shift"] )
+
+p_short_posterior = ggplot( posterior_samples ) +
+    geom_density( aes( x = short_prob ) ) +
+    geom_histogram( aes( x = short_prob, y = ..density.. ), alpha = 0.5, bins = 70 ) +
+    ggplot_theme +
+    scale_y_continuous( name = "Density" ) + scale_x_continuous( name = "short prob parameter", limits = short_prob_plot_limits ) +
+    geom_vline( xintercept = true_parameters["short_prob"] )
+
+mean_prp_posterior = ggplot( posterior_samples ) +
+    geom_density( aes( x = mean_prp ) ) +
+    geom_histogram( aes( x = mean_prp, y = ..density.. ), alpha = 0.5, bins = 70 ) +
+    ggplot_theme +
+    scale_y_continuous( name = "Density" ) + scale_x_continuous( name = "mean PRP parameter", limits = mean_prp_plot_limits ) +
+    geom_vline( xintercept = true_parameters["mean_prp"] )
+
+abc_posterior_plot = cowplot::align_plots( mean_irt_posterior, long_irt_shift_posterior, p_short_posterior, mean_prp_posterior, align = "hv" )
+abc_posterior_plot = grid.arrange( grobs = abc_posterior_plot, ncol = 2 )
+plot_save( abc_posterior_plot, height = 7.5, width = 7 )
+```
+
+ABC predictions
+```{r abc_predictions}
+if( !"predicted_ABC.RData" %in% list.files() ){
+    # Simulate 2000 event records for our predictions
+    set.seed(1)
+    simulate_parameters = posterior_samples[ sample( 1:.N, 1000, replace = T ), names(true_parameters), with = F ]
+    #Remember to change the .packages() if you are not using CAB2
+    predicted_event_records = foreach( x = 1:1000, .packages = c("data.table", "CAB2")) %dopar% {
+        parameters = simulate_parameters[x]
+        predicted_event_record = do.call( double_exp_model, parameters )
+        predicted_distributions = summary_statistics( predicted_event_record, iri = TRUE )
+        # Precompute the density for the IRT and IRI distributions
+        irt_density = density( predicted_distributions$irts[[1]], from = 0, n = 100 )
+        prp_density = density( predicted_distributions$prps[[1]], from = 0, to = 25, n = 100 )
+        iri_density = density( predicted_distributions$iris[[1]], from = 0, to = 75, n = 100 )
+        list( id = x, 
+            irts_x = irt_density$x, irts_y = irt_density$y, 
+            iris_x = iri_density$x, iris_y = iri_density$y,
+            prps_x = prp_density$x, prps_y = prp_density$y)
+    }
+    predicted_irts = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","irts_x","irts_y")]) ) )
+    predicted_iris = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","iris_x","iris_y")]) ) )
+    predicted_prps = rbindlist( lapply( predicted_event_records, function(x) as.data.table(x[c("id","prps_x","prps_y")]) ) )
+    save( predicted_irts, predicted_iris, predicted_prps, file = "predicted_ABC.RData" )
+} else{
+    load( "predicted_ABC.RData" )
+}
+```
+
+```{r plot abc predictions, fig.height = 3, fig.width = 3, echo = FALSE, fig.cap = "Figure 8. ABC predictions"}
+text_frame = data.table( x = Inf, y = c(Inf,-Inf), labels = c("Observed", "Predicted"), vjust = c(1,-0.1), hjust = c(1,1) )
+
+ABC_predicted_irts = ggplot() +
+    geom_line( aes( x = irts_x, y = -irts_y, group = id ), data = predicted_irts, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = irt_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "IRT (s)" ) +
+    scale_y_continuous( name = "Absolute Density", labels = abs, limits = 0.4*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+ABC_predicted_prps = ggplot() +
+    geom_line( aes( x = prps_x, y = -prps_y, group = id ), data = predicted_prps, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = prp_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "PRP (s)", limits = c(0,25) ) +
+    scale_y_continuous( name = "Absolute Density", labels = abs, limits = 0.2*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+ABC_predicted_iris = ggplot() +
+    geom_line( aes( x = iris_x, y = -iris_y, group = id ), data = predicted_iris, colour = "black", alpha = 0.05 ) +
+    geom_density( aes( x = V1 ), data = iri_data, stat = "density", fill = "grey50", colour = NA ) +
+    scale_x_continuous( name = "IRI (s)", breaks = c(0,25,50,75) ) +
+    scale_y_continuous( name = "Absolute Density (x100)", labels = function(x) abs(x)*100, limits = 0.15*c(-1,1) ) +
+    geom_text( aes( x = x, y = y, label = labels, vjust = vjust, hjust = hjust ), data = text_frame, size = 2 ) +
+    ggplot_theme
+
+ABC_predictions = cowplot::align_plots( ABC_predicted_irts, ABC_predicted_prps, ABC_predicted_iris, align = "hv" )
+ABC_prediction_plots = grid.arrange( grobs = ABC_predictions, ncol = 1 )
+
+plot_save( ABC_prediction_plots, width = 7, height = 9 )
+
+rm( predicted_irts, predicted_prps, predicted_iris )
+```
+
+```{r clean up}
+stopCluster(cl)
+```
