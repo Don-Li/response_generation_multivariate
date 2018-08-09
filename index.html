@@ -329,7 +329,7 @@ if ( !cluster_up ){
     cluster_up = TRUE
 }</code></pre>
 <p>This document contains examples of doing parameter estimation for response generating models from multiple perspectives; Bayesian, Frequentist, and a non-statistical approach. We use a toy example that of a model that represents an organism that generates responses at a constant rate, but sometimes engages in some extraneous behaviours before returning to respond at a constant rate. The schedule is an FI schedule with a hold on the reinforcer delivery for inter-response times that are below some threshold.</p>
-<p>Note that the code for making the plots are not shown. To see this code, refer to the .rmd file that generated this document.</p>
+<p>Note that the code for making the plots are not shown. To see this code, refer to the .rmd file (https://github.com/Don-Li/response_generation_multivariate) that generated this document.</p>
 <p>The model is shown below:</p>
 <pre class="r"><code>double_exp_model = function( mean_irt, long_irt_shift, short_prob, mean_prp ){
     
