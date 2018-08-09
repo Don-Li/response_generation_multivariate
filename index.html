@@ -585,7 +585,7 @@ Figure 5. Non-Statistical Predictions
     if ( is.na(sum_neg_log_likelihood) ) return( c(parameters,Inf, Inf, Inf ) )
     c( parameters, sum_neg_log_likelihood, irt_log_likelihood, prp_log_likelihood )
 }</code></pre>
-<p>To fit our model using the approximate likelihood technique, we defined an optimisaiton algorithm that searches the parameter space using Uniform distributions that gradually shrink as the model fitting process progresses. New parameters are proposed by taking up to the best 10 parameter configurations previously observed and then perturbing them by a small amount.</p>
+<p>To fit our model using the approximate likelihood technique, we used a grid of parameters and simulated the model at each parameter combination. This was mostly for our convenience, so that we did not have to deal with issues specific to the optimisation algorithm.</p>
 <pre class="r"><code>if ( ! &quot;likelihood_results.RData&quot; %in% list.files() ){
     set.seed(2)
     
